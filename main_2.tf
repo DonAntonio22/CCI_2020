@@ -45,43 +45,25 @@ resource "exoscale_instance_pool" "instancepoolCreation" {
   user_data = <<EOF
 #!/bin/bash
 set -e
-
-export DEBIAN_FRONTEND=noninteractive
-# Source 1 Script (S1): https://gist.github.com/janoszen/7ced227c54d1c9e86a9c1cbd93a451f2
-# Source 2 Kommentare (S2): https://docs.docker.com/engine/install/ubuntu/
-# region Install Docker
-# (S2) Falls es neuere Pakete gibt herunterladen und installieren
-apt-get update
-apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg-agent \
-    software-properties-common
-# (S2) hier wird der docker-GPG-key generiert
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-# (S2) line 64 shows the last 8 digits of GPG-key
-apt-key fingerprint 0EBFCD88
-# (S2) Erstellt ein repository für den docker
-add-apt-repository \
-   "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
-   $(lsb_release -cs) \
-   stable"
-# (S2) installiert docker engine
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io
-# endregion
-
-# region Launch containers
-# Source (S3): https://github.com/FH-Cloud-Computing/http-load-generator
-# (S3) generiert CPU Load und ermöglicht mir bei 8080 die Ansicht der Health das alles OK ist.
-# Run the load generator
-docker run -d \
-  --restart=always \
-  -p 8080:8080 \
-  janoszen/http-load-generator:1.0.1
-# endregion
-
+#falls es neuere Pakete gibt hole sie dir
+apt update
+# installiert docker
+curl -fsSL https://get.docker.com/ -o get-docker.sh
+sudo sh get-docker.sh
+# hole dir den http-load-generator
+sudo docker pull janoszen/http-load-generator:latest
+# wenn container 8080:8080 existiert lösche sie
+sudo docker run -d --rm -p 8080:8080 janoszen/http-load-generator
+# prometheus macht an sich nichts, node exporter (einfachste lösung) wird zum Lesen
+# von Daten benötigt, wie zum Beispiel CPU und Speicher Nutzung
+# Source: https://fh-cloud-computing.github.io/exercises/4-prometheus/
+# führe container aus mit port 9100:9100
+sudo docker run -d -p 9100:9100 \
+  --net="host" \
+  --pid="host" \
+  -v "/:/host:ro,rslave" \
+  quay.io/prometheus/node-exporter \
+  --path.rootfs=/host
 EOF
 
 }
@@ -130,4 +112,81 @@ resource "exoscale_nlb_service" "websiteService" {
     timeout  = 3
     retries  = 1
   }
+}
+
+#----------------------------------------------SPRINT 02----------------------------------------------------------------
+// Änderungen schon im node-exporter vorgenommen Sprint 01
+// es wird eine exoscale ressource über code anstatt über die weboberfläche
+resource "exoscale_compute" "prometheus" {
+  zone = var.zone
+  display_name = "name-for-prometheus"
+  template_id = data.exoscale_compute_template.ubuntuVersion.id
+  size = "Micro"
+  disk_size = 10
+  key_pair = ""
+  security_group_ids = [exoscale_security_group.sg.id]
+  user_data = <<EOF
+# Source: https://fh-cloud-computing.github.io/exercises/4-prometheus/
+#!/bin/bash
+set -e
+#falls updates vorhanden sind installiere diese
+sudo apt update
+# installiere promotheus
+sudo apt-get -y install prometheus
+# Erstellt das configuration file für prometheus, dieses wird in prometheus.yml geschrieben
+sudo echo "global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'prometheus'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: Monitoring Server Node Exporter
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+  - job_name: Service Discovery
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets.json
+        refresh_interval: 10s" > /etc/prometheus/prometheus.yml;
+# neustart des prometheus
+sudo systemctl restart prometheus
+# installiert docker
+curl -fsSL https://get.docker.com/ -o get-docker.sh
+sudo sh get-docker.sh
+sudo docker pull donantonio22/service_discovery:latest
+# ermöglicht das Ausführen von prometheus
+# Erklärung der Variablen: https://docs.docker.com/engine/reference/run/
+# -e setzt globale variable, -d startet container in detached mode,
+#-v speicher/volume
+sudo docker run \
+    -d \
+    -e EXOSCALE_KEY=${var.exoscale_key} \
+    -e EXOSCALE_SECRET=${var.exoscale_secret} \
+    -e EXOSCALE_ZONE=${var.zone} \
+    -e EXOSCALE_INSTANCEPOOL_ID=${exoscale_instance_pool.instancepoolCreation.id} \
+    -e TARGET_PORT=9100 \
+    -v /etc/prometheus:/prometheus \
+    donantonio22/service_discovery
+EOF
+}
+
+//hier werden die Regeln für den container erstellt, hier für prometheus
+resource "exoscale_security_group_rule" "prometheus" {
+  security_group_id = exoscale_security_group.sg.id
+  type = "INGRESS"
+  protocol = "TCP"
+  cidr = "0.0.0.0/0"
+  start_port = 9090
+  end_port = 9090
+}
+//hier werden die Reglen für container erstellt, hier für metrics_exporter
+resource "exoscale_security_group_rule" "metrics_exporter" {
+  security_group_id = exoscale_security_group.sg.id
+  type = "INGRESS"
+  protocol = "tcp"
+  cidr = "0.0.0.0/0"
+  start_port = 9100
+  end_port = 9100
 }
